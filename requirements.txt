@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+spacy
+pymupdf
+scikit-learn
+python-docx
+docx2txt
+matplotlib
+google-generativeai
+python-dotenv
+nltk
+torch
+transformers
