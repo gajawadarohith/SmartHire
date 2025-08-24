@@ -6,7 +6,7 @@ import zipfile
 import re
 import spacy
 import fitz  # PyMuPDF
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import docx2txt
 from io import BytesIO
@@ -15,255 +15,87 @@ import matplotlib.pyplot as plt
 import google.generativeai as genai
 import json
 from dotenv import load_dotenv
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import torch
-from transformers import AutoTokenizer, AutoModel
-import logging
-import pathlib
-import shutil
-from difflib import SequenceMatcher
-import unicodedata
-import tempfile
-import time
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('stopwords')
-
-# Load environment variables
 load_dotenv()
-
-# Configure Gemini API
-GEMINI_API_KEY = os.getenv("API_KEY")
-if not GEMINI_API_KEY:
-    st.error("Please set your Gemini API key in the .env file")
-    st.stop()
+# Set up Gemini API key
+GEMINI_API_KEY =os.getenv("API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
+
 
 # Set page configuration
 st.set_page_config(
-    page_title="Advanced Resume Screening & Ranking System",
+    page_title="Resume Screening & Ranking System",
     page_icon="📄",
     layout="wide"
 )
 
-# Create necessary directories with proper path handling
-def create_directories():
-    """Create necessary directories with proper error handling"""
-    try:
-        # Create a temporary directory for processing
-        temp_dir = tempfile.mkdtemp()
-        
-        # Create other directories
-        for directory in ["uploaded_resumes", "processed_data", "assets"]:
-            dir_path = pathlib.Path(directory)
-            if dir_path.exists():
-                try:
-                    shutil.rmtree(dir_path)
-                except PermissionError:
-                    logger.warning(f"Could not remove directory {dir_path}. It may be in use.")
-                except Exception as e:
-                    logger.error(f"Error removing directory {dir_path}: {e}")
-            
-            try:
-                dir_path.mkdir(exist_ok=True)
-            except Exception as e:
-                logger.error(f"Error creating directory {dir_path}: {e}")
-        
-        return temp_dir
-    except Exception as e:
-        logger.error(f"Error in directory creation: {e}")
-        st.error("Error creating necessary directories. Please check permissions.")
-        return None
+# Create folders if they don't exist
+if not os.path.exists("uploaded_resumes"):
+    os.makedirs("uploaded_resumes")
 
-# Create directories
-TEMP_DIR = create_directories()
-if not TEMP_DIR:
-    st.error("Failed to initialize the application. Please check permissions and try again.")
-    st.stop()
+if not os.path.exists("assets"):
+    os.makedirs("assets")
+    os.makedirs("assets/ResumeModel")
+    os.makedirs("assets/ResumeModel/output")
 
-# Load spaCy model with error handling
+# Function to load spaCy model
 @st.cache_resource
 def load_spacy_model():
     try:
+        # Try to load a pre-trained model if available
         return spacy.load('en_core_web_sm')
-    except Exception as e:
-        logger.error(f"Error loading spaCy model: {e}")
-        st.error("Error loading language model. Please try again.")
-        return None
+    except:
+        # If model isn't available, download it
+        st.info("Downloading language model for the first time (this may take a while)")
+        spacy.cli.download("en_core_web_sm")
+        return spacy.load('en_core_web_sm')
 
-# Load sentence transformer model with error handling
-@st.cache_resource
-def load_sentence_transformer():
-    try:
-        tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
-        model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
-        return tokenizer, model
-    except Exception as e:
-        logger.error(f"Error loading sentence transformer: {e}")
-        return None, None
-
-# Initialize models
 nlp = load_spacy_model()
-if not nlp:
-    st.error("Failed to load required models. Please try again.")
-    st.stop()
 
-tokenizer, sentence_model = load_sentence_transformer()
-
-def clean_text(text):
-    """Clean and normalize text with error handling"""
-    try:
-        # Remove special characters and normalize unicode
-        text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text)
-        # Remove LaTeX commands
-        text = re.sub(r'\\[a-zA-Z]+{[^}]*}', '', text)
-        text = re.sub(r'\\[a-zA-Z]+', '', text)
-        # Remove math mode
-        text = re.sub(r'\$[^$]*\$', '', text)
-        # Remove citations
-        text = re.sub(r'\\cite{[^}]*}', '', text)
-        # Remove references
-        text = re.sub(r'\\ref{[^}]*}', '', text)
-        return text.strip()
-    except Exception as e:
-        logger.error(f"Error cleaning text: {e}")
-        return text
-
+# Improved function to extract text from PDF with better structure preservation
 def extract_text_from_pdf(pdf_file):
-    """Extract text from PDF with improved error handling"""
     text = ""
     try:
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
-            temp_pdf.write(pdf_file.read())
-            temp_pdf_path = temp_pdf.name
-
-        # Open the temporary file
-        pdf_document = fitz.open(temp_pdf_path)
+        pdf_document = fitz.open(stream=pdf_file.read(), filetype="pdf")
         
         for page_num in range(len(pdf_document)):
-            try:
-                page = pdf_document.load_page(page_num)
-                blocks = page.get_text("blocks")
-                for block in blocks:
-                    block_text = clean_text(block[4])
-                    if block_text:
-                        text += block_text + "\n"
-                text += "\n"
-            except Exception as e:
-                logger.error(f"Error processing page {page_num}: {e}")
-                continue
-        
-        # Clean up
-        pdf_document.close()
-        os.unlink(temp_pdf_path)
-        
-        # Clean up text
+            page = pdf_document.load_page(page_num)
+            
+            # Extract text blocks to preserve structure
+            blocks = page.get_text("blocks")
+            for block in blocks:
+                text += block[4] + "\n"
+                
+            # Add extra line break between pages
+            text += "\n"
+            
+        # Clean up text - remove excessive newlines and spaces
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = re.sub(r' {2,}', ' ', text)
+        
         return text
     except Exception as e:
-        logger.error(f"Error extracting text from PDF: {e}")
+        st.error(f"Error extracting text from PDF: {e}")
         return ""
 
+# Function to extract text from DOCX
 def extract_text_from_docx(docx_file):
-    """Extract text from DOCX with improved error handling"""
     try:
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as temp_docx:
-            temp_docx.write(docx_file.read())
-            temp_docx_path = temp_docx.name
-
-        # Process the file
-        text = docx2txt.process(temp_docx_path)
-        text = clean_text(text)
+        text = docx2txt.process(docx_file)
+        # Clean up text - remove excessive newlines and spaces
         text = re.sub(r'\n{3,}', '\n\n', text)
         text = re.sub(r' {2,}', ' ', text)
-        
-        # Clean up
-        os.unlink(temp_docx_path)
         return text
     except Exception as e:
-        logger.error(f"Error extracting text from DOCX: {e}")
+        st.error(f"Error extracting text from DOCX: {e}")
         return ""
 
-def calculate_string_similarity(str1, str2):
-    """Calculate similarity between two strings"""
-    return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
-
-def analyze_job_description(job_description):
-    """Analyze job description using Gemini API with improved error handling"""
-    prompt = f"""
-    Analyze the following job description and extract key requirements and criteria.
-    Focus on:
-    1. Required skills (technical and non-technical)
-    2. Experience requirements
-    3. Educational qualifications
-    4. Key responsibilities
-    5. Preferred qualifications
-    6. Required certifications
-    7. Project requirements
-    
-    Job Description:
-    {job_description}
-    
-    Provide a structured analysis in JSON format with the following structure:
-    {{
-        "technical_skills": [],
-        "soft_skills": [],
-        "experience_years": 0,
-        "education": [],
-        "certifications": [],
-        "project_requirements": []
-    }}
-    """
-    
-    try:
-        model = genai.GenerativeModel("gemini-1.5-pro")
-        response = model.generate_content(prompt)
-        
-        # Clean the response text
-        response_text = response.text.strip()
-        if response_text.startswith('```json'):
-            response_text = response_text[7:]
-        if response_text.endswith('```'):
-            response_text = response_text[:-3]
-        
-        # Parse JSON with error handling
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError as e:
-            logger.error(f"Error parsing JSON response: {e}")
-            # Return default structure if JSON parsing fails
-            return {
-                "technical_skills": [],
-                "soft_skills": [],
-                "experience_years": 0,
-                "education": [],
-                "certifications": [],
-                "project_requirements": []
-            }
-    except Exception as e:
-        logger.error(f"Error analyzing job description: {e}")
-        return None
-
+# Enhanced function to process resumes and extract information
 def process_resume(text):
-    """Enhanced resume processing with improved information extraction"""
-    doc = nlp(text[:100000])
+    # Process with spaCy
+    doc = nlp(text[:100000])  # Limit to prevent memory issues with large docs
     
+    # Initialize dictionary for resume data
     resume_data = {
         "name": None,
         "email": None,
@@ -273,470 +105,555 @@ def process_resume(text):
         "experience": [],
         "projects": [],
         "certifications": [],
-        "extracurricular": [],
-        "cgpa": None,
-        "technical_skills": [],
-        "soft_skills": [],
-        "languages": [],
-        "achievements": []
+        "cgpa": None
     }
     
-    # Extract basic information with improved patterns
+    # Extract email with improved pattern
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-    phone_pattern = r'(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\d{10}'
-    
     emails = re.findall(email_pattern, text)
     if emails:
         resume_data["email"] = emails[0]
     
+    # Extract phone numbers with improved pattern
+    phone_pattern = r'(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\d{10}'
     phones = re.findall(phone_pattern, text)
     if phones:
         resume_data["phone"] = phones[0]
     
-    # Extract CGPA with improved patterns
+    # Extract CGPA with improved pattern matching
+    # This pattern matches common CGPA formats across many resume types
     cgpa_patterns = [
         r'(?:CGPA|GPA)(?:\s*[:of]\s|\s*[-=]?\s*)(\d+(?:\.\d+)?)',
         r'(?:CGPA|GPA)(?:\s*[:of]\s|\s*[-=]?\s*)(\d+(?:\.\d+)?)/\d+(?:\.\d+)?',
         r'(?:CGPA|GPA)(?:.?)(\d+\.\d+)(?:\s\/\s*\d+(?:\.\d+)?)?',
-        r'(\d+(?:\.\d+)?)\s*(?:CGPA|GPA)',
-        r'CGPA\s*[:=]\s*(\d+(?:\.\d+)?)',
-        r'GPA\s*[:=]\s*(\d+(?:\.\d+)?)'
     ]
     
     for pattern in cgpa_patterns:
         cgpa_matches = re.findall(pattern, text, re.IGNORECASE)
         if cgpa_matches:
             try:
+                # Extract just the number part if there's a fraction
                 cgpa_value = cgpa_matches[0].split('/')[0] if '/' in cgpa_matches[0] else cgpa_matches[0]
                 resume_data["cgpa"] = float(cgpa_value)
                 break
             except:
                 continue
     
-    # Extract sections using improved patterns
-    sections = {
-        "education": r'(?:EDUCATION|ACADEMIC QUALIFICATIONS|QUALIFICATIONS|EDUCATIONAL BACKGROUND|ACADEMIC)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)',
-        "experience": r'(?:EXPERIENCE|WORK EXPERIENCE|EMPLOYMENT|WORK HISTORY|PROFESSIONAL EXPERIENCE)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)',
-        "projects": r'(?:PROJECTS?|ACADEMIC PROJECTS?|PERSONAL PROJECTS?|RESEARCH PROJECTS?)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)',
-        "certifications": r'(?:CERTIFICATIONS?|COURSES?|TRAINING|PROFESSIONAL CERTIFICATIONS?)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)',
-        "extracurricular": r'(?:EXTRACURRICULAR|ACTIVITIES|VOLUNTEER|LEADERSHIP|POSITIONS OF RESPONSIBILITY)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)',
-        "achievements": r'(?:ACHIEVEMENTS|AWARDS|RECOGNITIONS|HONORS|MERITS)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)'
-    }
+    edu_section = re.search(r'(?:EDUCATION|ACADEMIC QUALIFICATIONS|QUALIFICATIONS|EDUCATIONAL BACKGROUND)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)', 
+                            text, re.IGNORECASE)
+
+    if edu_section:
+        edu_text = edu_section.group().strip()  # Get entire education section
+
+        # Split into individual entries based on line breaks
+        edu_lines = edu_text.split("\n")
+
+        # Extract relevant information (degree, institution, year, CGPA, percentage)
+        degree_pattern = r"(B\.?Tech|M\.?Tech|Ph\.?D|Bachelor|Master|MBA|MSc|BSc|BE|ME|Diploma|Intermediate)[^,\n]*"
+        institution_pattern = r"(University|College|Institute|School)[^,\n]*"
+        year_pattern = r"(\d{4}\s?[-–]\s?\d{4}|Expected\s?[A-Za-z]+\s?\d{4})"
+        score_pattern = r"(CGPA[:\s]*\d+\.\d+|Percentage[:\s]*\d+\.\d+)"
+
+        current_entry = ""
+        for line in edu_lines:
+            if re.search(degree_pattern, line, re.IGNORECASE):
+                if current_entry:  
+                    resume_data["education"].append(current_entry.strip())  # Store previous entry
+                current_entry = line  # Start new entry
+            elif re.search(institution_pattern, line, re.IGNORECASE) or re.search(year_pattern, line) or re.search(score_pattern, line):
+                current_entry += " " + line  # Append related information to current degree entry
+            else:
+                continue
+
+        # Append last entry
+        if current_entry:
+            resume_data["education"].append(current_entry.strip())
+
     
-    for section, pattern in sections.items():
-        section_match = re.search(pattern, text, re.IGNORECASE)
-        if section_match:
-            section_text = section_match.group().strip()
-            lines = [line.strip() for line in section_text.split('\n') if line.strip()]
-            if lines:
-                lines.pop(0)  # Remove section header
-                resume_data[section] = lines
-    
-    # Extract skills using improved categorization and fuzzy matching
-    technical_skills = [
+    # Extract skills with expanded keywords and improved pattern matching
+    skill_keywords = [
         "python", "java", "c\\+\\+", "javascript", "typescript", "html", "css", "react", "angular", 
         "node\\.js", "django", "flask", "express", "mongodb", "mysql", "postgresql", "redis",
         "aws", "azure", "gcp", "docker", "kubernetes", "terraform", "git", "devops", "ci/cd",
         "machine learning", "deep learning", "data analysis", "data science", "artificial intelligence", 
         "tensorflow", "pytorch", "keras", "nlp", "computer vision", "rust", "golang", "scala",
         "hadoop", "spark", "kafka", "tableau", "power bi", "excel", "word", "powerpoint", "sql",
-        "latex", "matlab", "r", "jupyter", "pandas", "numpy", "scikit-learn", "opencv", "tensorflow",
-        "pytorch", "keras", "spark", "hadoop", "kafka", "elasticsearch", "redis", "docker",
-        "kubernetes", "jenkins", "git", "jira", "confluence", "agile", "scrum", "kanban"
-    ]
-    
-    soft_skills = [
         "communication", "leadership", "teamwork", "problem solving", "critical thinking",
-        "agile", "scrum", "kanban", "project management", "time management", "analytical",
-        "creativity", "adaptability", "interpersonal", "negotiation", "presentation",
-        "collaboration", "decision making", "conflict resolution", "emotional intelligence",
-        "mentoring", "coaching", "public speaking", "writing", "research", "analysis"
+        "agile", "scrum", "kanban", "project management", "time management", "jenkins", "jira",
+        "graphql", "rest api", "microservices", "spring boot", "oop", "functional programming"
     ]
     
-    # Extract technical skills with fuzzy matching
-    for skill in technical_skills:
+    # Find skills section
+    skills_section = re.search(r'(?:SKILLS?|TECHNICAL SKILLS?|TECHNOLOGIES?)[^\n]\n+(.?)(?:\n\n|\n[A-Z]{2,}|\Z)', 
+                            text, re.IGNORECASE | re.DOTALL)
+    
+    if skills_section:
+        skills_text = skills_section.group(1).lower()
+        # Extract skills from the dedicated section
+        for skill in skill_keywords:
+            if re.search(r'\b' + re.escape(skill) + r'\b', skills_text):
+                if skill not in resume_data["skills"]:
+                    resume_data["skills"].append(skill)
+    
+    # Also look for skills throughout the document
+    for skill in skill_keywords:
         if re.search(r'\b' + re.escape(skill) + r'\b', text.lower()):
-            resume_data["technical_skills"].append(skill)
-        else:
-            # Try fuzzy matching for similar skills
-            words = text.lower().split()
-            for word in words:
-                if calculate_string_similarity(skill, word) > 0.8:  # 80% similarity threshold
-                    resume_data["technical_skills"].append(skill)
-                    break
+            if skill not in resume_data["skills"]:
+                resume_data["skills"].append(skill)
     
-    # Extract soft skills with fuzzy matching
-    for skill in soft_skills:
-        if re.search(r'\b' + re.escape(skill) + r'\b', text.lower()):
-            resume_data["soft_skills"].append(skill)
-        else:
-            # Try fuzzy matching for similar skills
-            words = text.lower().split()
-            for word in words:
-                if calculate_string_similarity(skill, word) > 0.8:  # 80% similarity threshold
-                    resume_data["soft_skills"].append(skill)
-                    break
+    # Extract experience with improved pattern matching
+    exp_section = re.search(r'(?:EXPERIENCE|WORK EXPERIENCE|EMPLOYMENT|WORK HISTORY)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)', 
+                            text, re.IGNORECASE)
+
+    if exp_section:
+        exp_text = exp_section.group().strip()  # Get full experience section
+
+        # Split based on new lines for better structuring
+        exp_lines = exp_text.split("\n")
+
+        experiences = []
+        current_exp = ""
+
+        for line in exp_lines:
+            # Check if the line contains a job title (Assuming job title starts with capital letters)
+            if re.match(r"^[A-Z].{3,}", line):  
+                if current_exp:
+                    experiences.append(current_exp.strip())  # Store previous experience
+                current_exp = line  # Start new experience
+            else:
+                current_exp += " " + line  # Append details to current job
+
+        # Append the last job experience
+        if current_exp:
+            experiences.append(current_exp.strip())
+
+        resume_data["experience"] = experiences
     
-    # Extract languages with improved pattern
-    language_pattern = r'(?:Languages?|Proficiency|Language Skills?)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)'
-    language_match = re.search(language_pattern, text, re.IGNORECASE)
-    if language_match:
-        language_text = language_match.group().strip()
-        languages = re.findall(r'[A-Za-z]+(?:\s+[A-Za-z]+)*', language_text)
-        resume_data["languages"] = [lang.strip() for lang in languages if lang.strip()]
+    # Extract certifications with improved pattern matching
+    cert_section = re.search(r'(?:CERTIFICATIONS?|COURSES?|TRAINING)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)', 
+                             text, re.IGNORECASE)
+
+    if cert_section:
+        cert_text = cert_section.group().strip()
+
+        # Extract certification lines and remove empty lines
+        certs = [line.strip() for line in cert_text.split("\n") if line.strip()]
+        
+        # Remove the section heading from the list
+        if certs:
+            certs.pop(0)  
+
+        resume_data["certifications"] = certs
     
-    # Extract name using NER and fallback methods
+    # Extract name using NER but also try alternative approaches
+    # First try to extract using NER
     for ent in doc.ents:
         if ent.label_ == "PERSON" and not resume_data["name"]:
-            if text.find(ent.text) < 500:
+            # Check if this appears at the beginning of the document (likely the candidate's name)
+            if text.find(ent.text) < 500:  # Only consider names near the start
                 resume_data["name"] = ent.text
     
+    # If name not found, try to use the first line that's not too long
     if not resume_data["name"]:
-        first_lines = text.strip().split('\n')[:5]
+        first_lines = text.strip().split('\n')[:5]  # Check first 5 lines
         for line in first_lines:
             line = line.strip()
+            # A name is typically short and doesn't contain special characters
             if 2 <= len(line.split()) <= 5 and re.match(r'^[A-Za-z\s.]+$', line):
                 resume_data["name"] = line
                 break
     
+    project_section = re.search(r'(?:PROJECTS?|ACADEMIC PROJECTS?|PERSONAL PROJECTS?)[\s\S]*?(?=\n[A-Z][A-Z ]+\n|\Z)', 
+                                text, re.IGNORECASE)
+
+    if project_section:
+        project_text = project_section.group().strip()  # Get full projects section
+
+        # Split based on line breaks, ensuring project entries are grouped correctly
+        project_lines = project_text.split("\n")
+
+        projects = []
+        current_project = ""
+
+        for line in project_lines:
+            # If the line starts with a likely project title (capitalized words), start a new project
+            if re.match(r"^[A-Za-z].{5,}", line):  # Ensures a valid project title (avoids single words)
+                if current_project:
+                    projects.append(current_project.strip())  # Store previous project
+                current_project = line  # Start new project
+            else:
+                current_project += " " + line  # Append description lines to current project
+
+        # Append the last project
+        if current_project:
+            projects.append(current_project.strip())
+
+        resume_data["projects"] = projects
+    
     return resume_data
 
-def calculate_match_score(resume_data, job_requirements):
-    """Calculate match score using improved scoring system"""
+# Enhanced function to calculate match score between resume and job requirements
+def calculate_match_score(resume_data, required_skills, min_cgpa, role_name):
     score = 0
     max_score = 100
     
-    # Technical Skills (35%)
-    if job_requirements.get("technical_skills"):
-        tech_skills_score = 0
-        for req_skill in job_requirements["technical_skills"]:
-            # Check for exact matches
-            if req_skill.lower() in [skill.lower() for skill in resume_data["technical_skills"]]:
-                tech_skills_score += 1
-            # Check for partial matches
-            else:
-                for skill in resume_data["technical_skills"]:
-                    if calculate_string_similarity(req_skill, skill) > 0.7:  # 70% similarity threshold
-                        tech_skills_score += 0.5
-                        break
-        tech_skills_percentage = (tech_skills_score / len(job_requirements["technical_skills"])) * 35
-        score += tech_skills_percentage
-    
-    # Soft Skills (25%)
-    if job_requirements.get("soft_skills"):
-        soft_skills_score = 0
-        for req_skill in job_requirements["soft_skills"]:
-            # Check for exact matches
-            if req_skill.lower() in [skill.lower() for skill in resume_data["soft_skills"]]:
-                soft_skills_score += 1
-            # Check for partial matches
-            else:
-                for skill in resume_data["soft_skills"]:
-                    if calculate_string_similarity(req_skill, skill) > 0.7:  # 70% similarity threshold
-                        soft_skills_score += 0.5
-                        break
-        soft_skills_percentage = (soft_skills_score / len(job_requirements["soft_skills"])) * 25
-        score += soft_skills_percentage
-    
-    # Experience (20%)
-    if job_requirements.get("experience_years"):
-        exp_score = min(len(resume_data["experience"]) / job_requirements["experience_years"], 1) * 20
-        score += exp_score
-    
-    # Education (10%)
-    if job_requirements.get("education"):
-        edu_score = 0
-        for edu in resume_data["education"]:
-            if any(req_edu.lower() in edu.lower() for req_edu in job_requirements["education"]):
-                edu_score += 1
-        edu_percentage = (edu_score / len(job_requirements["education"])) * 10
-        score += edu_percentage
-    
-    # Projects (10%)
-    if job_requirements.get("project_requirements"):
-        project_score = 0
-        for project in resume_data["projects"]:
-            if any(req.lower() in project.lower() for req in job_requirements["project_requirements"]):
-                project_score += 1
-        project_percentage = (project_score / len(job_requirements["project_requirements"])) * 10
-        score += project_percentage
-    
-    return round(score, 2)
-
-def save_resume_data(data, filename):
-    """Save resume data to JSON with improved error handling"""
-    try:
-        # Create a safe filename
-        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', os.path.splitext(filename)[0])
-        json_path = pathlib.Path("processed_data") / f"{safe_filename}.json"
+    # Skills matching (50%)
+    if required_skills:
+        skills_score = 0
+        matched_skills = []
         
-        # Ensure the directory exists
-        json_path.parent.mkdir(parents=True, exist_ok=True)
+        for skill in required_skills:
+            skill_lower = skill.lower()
+            # Check for exact matches and partial matches
+            if any(skill_lower == s.lower() for s in resume_data["skills"]):
+                skills_score += 1
+                matched_skills.append(skill)
+            elif any(skill_lower in s.lower() for s in resume_data["skills"]):
+                skills_score += 0.5  # Partial match
+                matched_skills.append(skill + " (partial)")
         
-        # Save the data
-        with open(json_path, 'w', encoding='utf-8') as json_file:
-            json.dump(data, json_file, indent=4)
-        return True
-    except Exception as e:
-        logger.error(f"Error saving JSON for {filename}: {e}")
-        return False
+        if len(required_skills) > 0:
+            skills_percentage = (skills_score / len(required_skills)) * 50
+        else:
+            skills_percentage = 0
+        score += skills_percentage
+    
+    # CGPA matching (20%)
+    cgpa_score = 0
+    if min_cgpa and resume_data["cgpa"]:
+        cgpa_score = min(resume_data["cgpa"] / min_cgpa, 1) * 20
+        score += cgpa_score
+    
+    # Role matching (15%)
+    role_score = 0
+    if role_name:
+        text = " ".join([
+            " ".join(resume_data["experience"]) if resume_data["experience"] else "",
+            " ".join(resume_data["projects"]) if resume_data["projects"] else "",
+            " ".join(resume_data["education"]) if resume_data["education"] else ""
+        ])
+        
+        # Check for exact and partial role matches
+        if re.search(r'\b' + re.escape(role_name) + r'\b', text, re.IGNORECASE):
+            role_score = 15
+        elif any(word.lower() in text.lower() for word in role_name.split()):
+            role_score = 7.5  # Partial match
+        
+        score += role_score
+    
+    # Projects and certifications (15%)
+    projects_count = len(resume_data["projects"])
+    certs_count = len(resume_data["certifications"])
+    projects_certs_score = min(projects_count + certs_count, 5) / 5 * 15
+    score += projects_certs_score
+    
+    # Return overall score and component scores for detailed analysis
+    return {
+        "total_score": round(score, 2),
+        "skills_score": round(skills_percentage if 'skills_percentage' in locals() else 0, 2),
+        "cgpa_score": round(cgpa_score, 2),
+        "role_score": round(role_score, 2),
+        "projects_certs_score": round(projects_certs_score, 2),
+        "matched_skills": matched_skills if 'matched_skills' in locals() else []
+    }
 
-def process_zip_file(zip_file):
-    """Process ZIP file containing resumes with improved error handling"""
-    resume_data = {}
+# Function to handle file upload
+def handle_uploaded_file(uploaded_file):
+    file_ext = uploaded_file.name.split('.')[-1].lower()
+    
+    if file_ext == 'pdf':
+        return extract_text_from_pdf(uploaded_file)
+    elif file_ext in ['docx', 'doc']:
+        return extract_text_from_docx(uploaded_file)
+    else:
+        st.warning(f"Unsupported file format: {file_ext}")
+        return ""
+
+# Enhanced function to handle zip file upload
+def handle_zip_upload(zip_file):
+    resume_texts = {}
     
     try:
         with zipfile.ZipFile(zip_file) as z:
             for file_name in z.namelist():
                 if file_name.endswith(('.pdf', '.docx', '.doc')) and not file_name.startswith('__MACOSX'):
-                    try:
-                        with z.open(file_name) as f:
-                            content = BytesIO(f.read())
-                            if file_name.endswith('.pdf'):
-                                text = extract_text_from_pdf(content)
-                            elif file_name.endswith(('.docx', '.doc')):
-                                text = extract_text_from_docx(content)
-                            
-                            if text:
-                                processed_data = process_resume(text)
-                                resume_data[file_name] = processed_data
+                    with z.open(file_name) as f:
+                        content = BytesIO(f.read())
+                        if file_name.endswith('.pdf'):
+                            try:
+                                pdf_document = fitz.open(stream=content.getvalue(), filetype="pdf")
+                                text = ""
+                                for page_num in range(len(pdf_document)):
+                                    page = pdf_document.load_page(page_num)
+                                    # Extract text blocks to preserve structure
+                                    blocks = page.get_text("blocks")
+                                    for block in blocks:
+                                        text += block[4] + "\n"
+                                    # Add extra line break between pages
+                                    text += "\n"
                                 
-                                # Save to JSON
-                                save_resume_data(processed_data, file_name)
-                    except Exception as e:
-                        logger.error(f"Error processing file {file_name}: {e}")
-                        continue
-    
+                                # Clean up text
+                                text = re.sub(r'\n{3,}', '\n\n', text)
+                                text = re.sub(r' {2,}', ' ', text)
+                                
+                                resume_texts[file_name] = text
+                            except Exception as e:
+                                st.error(f"Error processing {file_name}: {e}")
+                        elif file_name.endswith(('.docx', '.doc')):
+                            try:
+                                text = docx2txt.process(content)
+                                text = re.sub(r'\n{3,}', '\n\n', text)
+                                text = re.sub(r' {2,}', ' ', text)
+                                resume_texts[file_name] = text
+                            except Exception as e:
+                                st.error(f"Error processing {file_name}: {e}")
     except Exception as e:
-        logger.error(f"Error processing ZIP file: {e}")
-        st.error(f"Error processing ZIP file: {e}")
+        st.error(f"Error processing zip file: {e}")
     
-    return resume_data
+    return resume_texts
 
+# Function to create a download link for CSV file
 def get_csv_download_link(df, filename="ranked_candidates.csv"):
-    """Create download link for CSV file"""
     csv = df.to_csv(index=False)
     b64 = base64.b64encode(csv.encode()).decode()
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" class="btn" style="background-color:#4CAF50;color:white;padding:8px 12px;text-decoration:none;border-radius:4px;">Download Ranked Candidates CSV</a>'
     return href
 
-def create_match_score_plot(df_results):
-    """Create match score plot with improved error handling"""
-    try:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        df_results_sorted = df_results.sort_values(by="Match Score", ascending=False)
-        
-        # Create bar plot
-        bars = ax.bar(range(len(df_results_sorted)), df_results_sorted["Match Score"], color='royalblue')
-        
-        # Set labels and title
-        ax.set_xlabel("Applicants")
-        ax.set_ylabel("Match Score (%)")
-        ax.set_title("Match Scores of Applicants")
-        
-        # Set x-axis ticks and labels
-        ax.set_xticks(range(len(df_results_sorted)))
-        ax.set_xticklabels(df_results_sorted["Name"], rotation=45, ha="right", fontsize=8)
-        
-        # Set y-axis limits
-        ax.set_ylim(0, 100)
-        
-        # Adjust layout
-        plt.tight_layout()
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Error creating match score plot: {e}")
-        return None
+def analyze_with_gemini(resume_data, job_description):
+    prompt = f"""
+        You are an AI specialized in resume screening. Analyze the following resume and compare it to the given job description.
 
-def main():
+        **Resume Data:**
+        {resume_data}
+
+        **Job Description:**
+        {job_description}
+
+        **Scoring Guide:**
+        - **Degree:** Prioritize major over degree level. More relevant degrees get higher scores.
+        - **Experience:** More relevant experience gets higher scores.
+        - **Technical Skills:** More matching technical skills get higher scores.
+        - **Responsibilities:** More matching responsibilities get higher scores.
+        - **Certificates:** Required certificates get full points; related certificates get partial points.
+        - **Soft Skills:** Foreign language and leadership skills are prioritized.
+
+        **Evaluation Criteria (0-100 Scale):**
+        - **Degree:** Evaluate relevance of candidate's degree.
+        - **Experience:** Assess relevance and duration of experience.
+        - **Technical Skills:** Compare technical expertise to job requirements.
+        - **Responsibilities:** Match past responsibilities with job expectations.
+        - **Certificates:** Score based on required and related certificates.
+        - **Soft Skills:** Consider foreign languages and leadership.
+        - **Overall Summary:** Provide a conclusion based on the scores.
+
+        **Output:** Provide a **well-structured text-based** summary, NOT in JSON format.
+        """
+
     try:
-        st.title("Advanced Resume Screening & Ranking System")
-        
-        tab1, tab2 = st.tabs(["Resume Screening", "About the System"])
-        
-        with tab1:
-            st.header("Upload Resumes & Job Description")
-            
-            col1, col2 = st.columns([1, 1])
-            
-            with col1:
-                st.subheader("Upload Resumes")
-                zip_file = st.file_uploader("Upload ZIP file containing resumes", type=["zip"])
-                
-                if zip_file:
-                    with st.spinner("Processing resumes..."):
-                        resume_data = process_zip_file(zip_file)
-                        if resume_data:
-                            st.success(f"Successfully processed {len(resume_data)} resumes")
-                        else:
-                            st.error("No valid resumes found in the ZIP file")
-            
-            with col2:
-                st.subheader("Job Description")
-                job_description = st.text_area("Enter job description:", height=200)
-                
-                if job_description:
-                    with st.spinner("Analyzing job description..."):
-                        job_requirements = analyze_job_description(job_description)
-                        if job_requirements:
-                            st.success("Job requirements analyzed successfully")
-                        else:
-                            st.error("Error analyzing job description. Please try again.")
-            
-            if st.button("Screen & Rank Resumes") and resume_data and job_requirements:
-                with st.spinner("Calculating rankings..."):
-                    try:
-                        results = []
-                        detailed_data = {}
-                        
-                        for filename, data in resume_data.items():
-                            match_score = calculate_match_score(data, job_requirements)
-                            
-                            detailed_data[filename] = {
-                                "resume_data": data,
-                                "match_score": match_score
-                            }
-                            
-                            results.append({
-                                "Filename": filename,
-                                "Name": data["name"] or "Unknown",
-                                "Email": data["email"] or "Not found",
-                                "Phone": data["phone"] or "Not found",
-                                "CGPA": float(data["cgpa"]) if data["cgpa"] else 0.0,
-                                "Technical Skills": ", ".join(data["technical_skills"]),
-                                "Soft Skills": ", ".join(data["soft_skills"]),
-                                "Match Score": match_score
-                            })
-                        
-                        # Create DataFrame and sort by match score
-                        df_results = pd.DataFrame(results).sort_values(by="Match Score", ascending=False)
-                        
-                        # Display results
-                        st.header("Ranking Results")
-                        
-                        # Display top candidates
-                        st.subheader("Top Candidates")
-                        st.dataframe(df_results, use_container_width=True)
-                        
-                        # Create download link for CSV
-                        st.markdown(get_csv_download_link(df_results), unsafe_allow_html=True)
-                        
-                        # Show detailed info for top candidates
-                        st.subheader("Top Candidates Details")
-                        top_candidates = df_results.head(min(5, len(df_results)))
-                        
-                        for i, (_, row) in enumerate(top_candidates.iterrows(), 1):
-                            filename = row['Filename']
-                            detail = detailed_data[filename]
-                            
-                            with st.expander(f"#{i}: {row['Name']} - Match Score: {row['Match Score']}%"):
-                                col1, col2 = st.columns(2)
-                                
-                                with col1:
-                                    st.write("**Contact Information:**")
-                                    st.write(f"- Email: {row['Email']}")
-                                    st.write(f"- Phone: {row['Phone']}")
-                                    st.write("**Education:**")
-                                    st.write(f"- CGPA: {row['CGPA']}")
-                                    for edu in detail["resume_data"]["education"]:
-                                        st.write(f"- {edu}")
-                                
-                                with col2:
-                                    st.write("**Skills:**")
-                                    st.write("Technical Skills:")
-                                    for skill in detail["resume_data"]["technical_skills"]:
-                                        st.write(f"- {skill}")
-                                    st.write("Soft Skills:")
-                                    for skill in detail["resume_data"]["soft_skills"]:
-                                        st.write(f"- {skill}")
-                                
-                                if detail["resume_data"]["projects"]:
-                                    st.write("**Projects:**")
-                                    for project in detail["resume_data"]["projects"][:3]:
-                                        st.write(f"- {project}")
-                                
-                                if detail["resume_data"]["experience"]:
-                                    st.write("**Experience:**")
-                                    for exp in detail["resume_data"]["experience"][:3]:
-                                        st.write(f"- {exp}")
-                                
-                                if detail["resume_data"]["certifications"]:
-                                    st.write("**Certifications:**")
-                                    for cert in detail["resume_data"]["certifications"][:3]:
-                                        st.write(f"- {cert}")
-                                
-                                if detail["resume_data"]["extracurricular"]:
-                                    st.write("**Extracurricular Activities:**")
-                                    for activity in detail["resume_data"]["extracurricular"][:3]:
-                                        st.write(f"- {activity}")
-                        
-                        # Display match score distribution
-                        st.subheader("Match Score Distribution")
-                        fig = create_match_score_plot(df_results)
-                        if fig:
-                            st.pyplot(fig)
-                        else:
-                            st.error("Error creating match score plot")
-                    
-                    except Exception as e:
-                        logger.error(f"Error processing results: {e}")
-                        st.error("Error processing results. Please try again.")
-        
-        with tab2:
-            st.header("About the Resume Screening System")
-            
-            st.write("""
-            This advanced resume screening and ranking system helps employers efficiently filter through job applications
-            by automatically extracting key information from resumes and ranking candidates based on job requirements.
-            
-            ### Key Features:
-            
-            1. **Intelligent Resume Processing**:
-               - Extracts information from PDF and DOCX formats
-               - Preserves document structure
-               - Stores processed data in JSON format
-            
-            2. **Advanced Job Description Analysis**:
-               - Uses Gemini API for intelligent analysis
-               - Extracts key requirements and criteria
-               - Identifies technical and soft skills
-            
-            3. **Comprehensive Matching System**:
-               - Technical skills matching (35%)
-               - Soft skills matching (25%)
-               - Experience evaluation (20%)
-               - Education matching (10%)
-               - Project relevance (10%)
-            
-            4. **Detailed Candidate Profiles**:
-               - Contact information
-               - Educational background
-               - Technical and soft skills
-               - Project experience
-               - Work experience
-               - Certifications
-               - Extracurricular activities
-            
-            5. **Visual Analytics**:
-               - Match score distribution
-               - Detailed candidate comparisons
-               - Exportable results
-            
-            6. **Bulk Processing**:
-               - Supports ZIP file uploads
-               - Processes multiple resumes simultaneously
-               - Generates comprehensive reports
-            """)
-            
-            st.info("""
-            *Note*: This system is designed to assist in the initial screening process. 
-            It is recommended to review the top candidates manually for a more comprehensive evaluation.
-            """)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        result = response.text  # Convert response to JSON
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# Main app UI
+st.title("Automated Resume Screening & Ranking System")
+
+tab1, tab2 = st.tabs(["Resume Screening", "About the System"])
+
+with tab1:
+    st.header("Upload Resumes & Set Requirements")
     
-    except Exception as e:
-        logger.error(f"Error in main function: {e}")
-        st.error("An unexpected error occurred. Please try again.")
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("Upload Resumes")
+        upload_option = st.radio("Choose upload method:", ["Individual Files", "Zip File"])
+        
+        resume_texts = {}
+        
+        if upload_option == "Individual Files":
+            uploaded_files = st.file_uploader("Upload resumes (PDF or DOCX)", type=["pdf", "docx"], accept_multiple_files=True)
+            if uploaded_files:
+                with st.spinner("Processing uploaded files..."):
+                    for file in uploaded_files:
+                        text = handle_uploaded_file(file)
+                        if text:
+                            resume_texts[file.name] = text
+                    
+                    st.success(f"Successfully processed {len(resume_texts)} resumes")
+        
+        else:  # Zip File
+            zip_file = st.file_uploader("Upload ZIP file containing resumes", type=["zip"])
+            if zip_file:
+                with st.spinner("Extracting resumes from ZIP file..."):
+                    resume_texts = handle_zip_upload(zip_file)
+                    st.success(f"Successfully extracted {len(resume_texts)} resumes from ZIP file")
+    
+    with col2:
+        st.subheader("Set Job Requirements")
+        
+        role_name = st.text_input("Job Title/Role:", placeholder="e.g., Data Scientist, Software Engineer")
+        
+        min_cgpa = st.number_input("Minimum CGPA Required:", min_value=0.0, max_value=10.0, value=7.0, step=0.1)
+        
+        skills_input = st.text_area("Required Skills (one per line):", 
+                                   placeholder="e.g.,\nPython\nMachine Learning\nSQL")
+        
+        required_skills = [skill.strip() for skill in skills_input.split("\n") if skill.strip()]
+        
+        additional_keywords = st.text_input("Additional Keywords (comma separated):", 
+                                           placeholder="e.g., AWS, leadership, agile")
+        
+        if additional_keywords:
+            additional_keywords = [k.strip() for k in additional_keywords.split(",") if k.strip()]
+            required_skills.extend(additional_keywords)
+    
+    if st.button("Screen & Rank Resumes") and resume_texts:
+        with st.spinner("Processing resumes and calculating rankings..."):
+            results = []
+            detailed_data = {}
+            
+            for filename, text in resume_texts.items():
+                resume_data = process_resume(text)
+                match_scores = calculate_match_score(
+                    resume_data, required_skills, min_cgpa, role_name
+                )
+                job_description = {
+                   "required_skills": required_skills,  # List of required skills
+                    "min_cgpa": min_cgpa,  # Minimum CGPA requirement
+                    "role_name": role_name  # Job title
+                                   }
+                print(resume_data)
+                analysis = analyze_with_gemini(resume_data,job_description)
+                # Store detailed data for expanded view
+                detailed_data[filename] = {
+                    "resume_data": resume_data,
+                    "match_scores": match_scores,
+                    "Ai_Analysis":analysis
+                }
+                
+                results.append({
+                    "Filename": filename,
+                    "Name": resume_data["name"] or "Unknown",
+                    "Email": resume_data["email"] or "Not found",
+                    "Phone": resume_data["phone"] or "Not found",
+                    "CGPA": resume_data["cgpa"] or "Not found",
+                    "Skills": ", ".join(resume_data["skills"]),
+                    "Match Score": match_scores["total_score"],
+                    "Ai Analysis":analysis
+                })
+            
+            # Create DataFrame and sort by match score
+            df_results = pd.DataFrame(results).sort_values(by="Match Score", ascending=False)
+            
+            # Display results
+            st.header("Ranking Results")
+            
+            # Display top candidates
+            st.subheader("Top Candidates")
+            st.dataframe(df_results, use_container_width=True)
+            
+            # Create download link for CSV
+            st.markdown(get_csv_download_link(df_results), unsafe_allow_html=True)
+            
+            # Show detailed info for top candidates
+            st.subheader("Top Candidates Details")
+            top_candidates = df_results.head(min(5, len(df_results)))
+            
+            for i, (_, row) in enumerate(top_candidates.iterrows(), 1):
+                filename = row['Filename']
+                detail = detailed_data[filename]
+                
+                with st.expander(f"#{i}: {row['Name']} - Match Score: {row['Match Score']}%"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write(f"*Contact Information:*")
+                        st.write(f"- Email: {row['Email']}")
+                        st.write(f"- Phone: {row['Phone']}")
+                        st.write(f"*Education:*")
+                        st.write(f"- CGPA: {row['CGPA']}")
+                        for edu in detail["resume_data"]["education"]:
+                            st.write(f"- {edu}")
+                    
+                    with col2:
+                        st.write(f"*Match Score Details:*")
+                        st.write(f"- Skills: {detail['match_scores']['skills_score']}/50")
+                        st.write(f"- CGPA: {detail['match_scores']['cgpa_score']}/20")
+                        st.write(f"- Role: {detail['match_scores']['role_score']}/15")
+                        st.write(f"- Projects & Certs: {detail['match_scores']['projects_certs_score']}/15")
+                        
+                        if detail["match_scores"]["matched_skills"]:
+                            st.write("*Matched Skills:*")
+                            for skill in detail["match_scores"]["matched_skills"]:
+                                st.write(f"- {skill}")
+                    
+                    # Additional sections
+                    if detail["resume_data"]["projects"]:
+                        st.write("*Projects:*")
+                        for project in detail["resume_data"]["projects"][:3]:  # Show up to 3 projects
+                            st.write(f"- {project}")
+                    
+                    if detail["resume_data"]["certifications"]:
+                        st.write("*Certifications:*")
+                        for cert in detail["resume_data"]["certifications"][:3]:  # Show up to 3 certs
+                            st.write(f"- {cert}")
+                    
+                    if detail["resume_data"]["experience"]:
+                        st.write("*Experience:*")
+                        for exp in detail["resume_data"]["experience"][:3]:  # Show up to 3 experiences
+                            st.write(f"- {exp}")
+            col1, col2, col3 = st.columns([1, 4, 1])  # Centering effect
 
-if __name__ == "__main__":
-    main()
+            with col2:  # Place graph in the middle column
+             st.subheader("Match Score Distribution")
+    
+             fig, ax = plt.subplots(figsize=(8,4))
+             df_results_sorted = df_results.sort_values(by="Match Score", ascending=False)
+
+             ax.bar(df_results_sorted["Name"], df_results_sorted["Match Score"], color='royalblue')
+             ax.set_xlabel("Applicants")
+             ax.set_ylabel("Match Score (%)")
+             ax.set_title("Match Scores of Applicants")
+             ax.set_xticklabels(df_results_sorted["Name"], rotation=45, ha="right", fontsize=8)
+             ax.set_ylim(0, 100)
+
+             fig.tight_layout()
+    
+             st.pyplot(fig)
+with tab2:
+    st.header("About the Resume Screening System")
+    
+    st.write("""
+    This automated resume screening and ranking system helps employers efficiently filter through job applications
+    by automatically extracting key information from resumes and ranking candidates based on job requirements.
+    
+    ### Key Features:
+    
+    1. *Resume Parsing*: Extracts essential information like name, email, skills, education, and experience from 
+       uploaded resumes in PDF or DOCX formats.
+       
+    2. *Customizable Requirements*: Allows employers to specify job-specific requirements including:
+       - Minimum CGPA
+       - Required skills
+       - Job title/role
+       - Additional keywords
+       
+    3. *Smart Ranking*: Calculates match scores based on multiple factors:
+       - Skills matching (50%)
+       - CGPA comparison (20%)
+       - Role relevance (15%)
+       - Projects and certifications (15%)
+       
+    4. *Bulk Processing*: Supports both individual resume uploads and batch processing via ZIP files.
+    
+    5. *Exportable Results*: Results can be downloaded as CSV files for further analysis.
+    """)
+    
+    st.info("""
+    *Note*: This system is designed to assist in the initial screening process. 
+    It is recommended to review the top candidates manually for a more comprehensive evaluation.
+    """)
