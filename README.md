@@ -93,7 +93,3 @@ resume-screening/
 ├── .env                   # Environment variables (create this)
 ├── Dataset/               # Sample resumes
 ```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE
